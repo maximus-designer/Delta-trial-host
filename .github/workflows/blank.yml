@@ -73,7 +73,7 @@ jobs:
 
           Remove-Item $installer -Force
 
-      - name: Connect Tailscale Through Railway Exit Node
+      - name: Connect Tailscale
         shell: powershell
         run: |
           Write-Host "Connecting to Tailscale..."
@@ -88,7 +88,6 @@ jobs:
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
             --hostname="github-rdp-${{ github.run_id }}" `
             --accept-routes `
-            --exit-node=100.117.225.16 `
             --reset
 
           if ($LASTEXITCODE -ne 0) {
@@ -123,7 +122,7 @@ jobs:
           Write-Host "================================="
           & $tailscale status
 
-      - name: Verify Exit Node Public IP
+      - name: Verify Public IP
         shell: powershell
         run: |
           Write-Host ""
@@ -187,12 +186,12 @@ jobs:
         shell: powershell
         run: |
           Write-Host "Keeping runner alive for 6 hours..."
-          
+
           $endTime = (Get-Date).AddMinutes(355)
-          
+
           while ((Get-Date) -lt $endTime) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active..."
             Start-Sleep -Seconds 60
           }
-          
+
           Write-Host "Session timeout reached. Shutting down gracefully."
