@@ -2,6 +2,19 @@ name: Secure RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      restore_session:
+        description: "Restore previous session data from cache?"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  workflow_run:
+    workflows: ["Secure RDP"]
+    types:
+      - completed
 
 jobs:
   rdp:
@@ -9,189 +22,408 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ─────────────────────────────────────────────
+      # RESTORE ALL CACHES
+      # ─────────────────────────────────────────────
+      - name: Restore Session Metadata Cache
+        id: cache-meta
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\rdp-session
+          key: rdp-session-data
+          restore-keys: rdp-session-
+
+      - name: Restore User Data Cache (Desktop + Documents + Downloads)
+        id: cache-userdata
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\rdp-userdata
+          key: rdp-userdata-v1
+          restore-keys: rdp-userdata-
+
+      - name: Restore AppData Cache
+        id: cache-appdata
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\rdp-appdata
+          key: rdp-appdata-v1
+          restore-keys: rdp-appdata-
+
+      - name: Restore Browser Data Cache
+        id: cache-browser
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\rdp-browser
+          key: rdp-browser-v1
+          restore-keys: rdp-browser-
+
+      # ─────────────────────────────────────────────
+      # LOAD SESSION METADATA
+      # ─────────────────────────────────────────────
+      - name: Load Cached Session Data
+        shell: powershell
+        run: |
+          $cacheFile = "C:\rdp-session\session.json"
+          if (Test-Path $cacheFile) {
+            Write-Host "Cache found — loading previous session data..."
+            $session = Get-Content $cacheFile | ConvertFrom-Json
+            echo "CACHED_RUN_COUNT=$($session.run_count)"   >> $env:GITHUB_ENV
+            echo "CACHED_CREATED_AT=$($session.created_at)" >> $env:GITHUB_ENV
+            Write-Host "Previous runs : $($session.run_count)"
+            Write-Host "First created : $($session.created_at)"
+          } else {
+            Write-Host "No previous cache — fresh session."
+            echo "CACHED_RUN_COUNT=0"                                          >> $env:GITHUB_ENV
+            echo "CACHED_CREATED_AT=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" >> $env:GITHUB_ENV
+          }
+
+      # ─────────────────────────────────────────────
+      # CONFIGURE RDP
+      # ─────────────────────────────────────────────
       - name: Configure Windows RDP
         shell: powershell
         run: |
-          Write-Host "Enabling RDP..."
-
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
-            -Value 0
+            -Name "fDenyTSConnections" -Value 0
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
-            -Value 1
+            -Name "UserAuthentication" -Value 1
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
           Restart-Service TermService -Force
+          Write-Host "RDP configured."
 
+      # ─────────────────────────────────────────────
+      # CREATE RDP USER
+      # ─────────────────────────────────────────────
       - name: Create RDP User
         shell: powershell
         run: |
-          Write-Host "Creating RDP user..."
-
-          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
-          $password = -join ((1..20) | ForEach-Object {
-            $chars[(Get-Random -Maximum $chars.Length)]
-          })
-
+          $chars    = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*'
+          $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "RDP"
           }
 
-          New-LocalUser `
-            -Name "RDP" `
-            -Password $securePass `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
-
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "RDP user created."
 
+      # ─────────────────────────────────────────────
+      # RESTORE SAVED USER FILES INTO RDP PROFILE
+      # ─────────────────────────────────────────────
+      - name: Restore User Files into RDP Profile
+        shell: powershell
+        run: |
+          $rdpHome = "C:\Users\RDP"
+
+          # Wait until the RDP user profile directory is created
+          for ($i = 0; $i -lt 10; $i++) {
+            if (Test-Path $rdpHome) { break }
+            Start-Sleep -Seconds 3
+          }
+          # Force profile creation if needed
+          if (-not (Test-Path $rdpHome)) {
+            New-Item -ItemType Directory -Force -Path $rdpHome | Out-Null
+          }
+
+          function Restore-Folder($src, $dst) {
+            if (Test-Path $src) {
+              Write-Host "Restoring $src -> $dst"
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+              Write-Host "No cache for: $src (skipping)"
+            }
+          }
+
+          # User data
+          Restore-Folder "C:\rdp-userdata\Desktop"   "$rdpHome\Desktop"
+          Restore-Folder "C:\rdp-userdata\Documents" "$rdpHome\Documents"
+          Restore-Folder "C:\rdp-userdata\Downloads" "$rdpHome\Downloads"
+          Restore-Folder "C:\rdp-userdata\Pictures"  "$rdpHome\Pictures"
+          Restore-Folder "C:\rdp-userdata\Videos"    "$rdpHome\Videos"
+          Restore-Folder "C:\rdp-userdata\Music"     "$rdpHome\Music"
+
+          # AppData
+          Restore-Folder "C:\rdp-appdata\Roaming"   "$rdpHome\AppData\Roaming"
+          Restore-Folder "C:\rdp-appdata\Local"      "$rdpHome\AppData\Local"
+
+          # Browser data (Chrome)
+          $chromeSrc = "C:\rdp-browser\Chrome"
+          $chromeDst = "$rdpHome\AppData\Local\Google\Chrome\User Data"
+          if (Test-Path $chromeSrc) {
+            Restore-Folder $chromeSrc $chromeDst
+          }
+
+          # Browser data (Edge)
+          $edgeSrc = "C:\rdp-browser\Edge"
+          $edgeDst = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
+          if (Test-Path $edgeSrc) {
+            Restore-Folder $edgeSrc $edgeDst
+          }
+
+          Write-Host "All cached files restored into RDP profile."
+
+      # ─────────────────────────────────────────────
+      # INSTALL TAILSCALE
+      # ─────────────────────────────────────────────
       - name: Install Tailscale
         shell: powershell
         run: |
-          Write-Host "Installing Tailscale..."
-
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $url       = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installer = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $installer
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$installer`" /qn /norestart" `
-            -Wait
-
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
           Remove-Item $installer -Force
+          Write-Host "Tailscale installed."
 
+      # ─────────────────────────────────────────────
+      # CONNECT TAILSCALE
+      # ─────────────────────────────────────────────
       - name: Connect Tailscale
         shell: powershell
         run: |
-          Write-Host "Connecting to Tailscale..."
-
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname  = "github-rdp-${{ github.run_id }}"
 
           Start-Service Tailscale
-
           Start-Sleep -Seconds 10
 
           & $tailscale up `
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
-            --hostname="github-rdp-${{ github.run_id }}" `
+            --hostname="$hostname" `
             --accept-routes `
             --reset
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Tailscale failed"
-            exit 1
-          }
+          if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale failed"; exit 1 }
 
           $ip = $null
-
           for ($i = 0; $i -lt 20; $i++) {
-            try {
-              $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim()
-            } catch {}
-
-            if ($ip) {
-              break
-            }
-
+            try { $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim() } catch {}
+            if ($ip) { break }
             Start-Sleep -Seconds 5
           }
 
-          if (-not $ip) {
-            Write-Error "No Tailscale IP assigned"
-            exit 1
-          }
+          if (-not $ip) { Write-Error "No Tailscale IP assigned"; exit 1 }
 
-          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-          Write-Host ""
-          Write-Host "================================="
-          Write-Host "TAILSCALE STATUS"
-          Write-Host "================================="
+          echo "TAILSCALE_IP=$ip"        >> $env:GITHUB_ENV
+          echo "TS_HOSTNAME=$hostname"   >> $env:GITHUB_ENV
           & $tailscale status
 
+      # ─────────────────────────────────────────────
+      # VERIFY PUBLIC IP & RDP PORT
+      # ─────────────────────────────────────────────
       - name: Verify Public IP
         shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "================================="
-          Write-Host "PUBLIC IP"
-          Write-Host "================================="
-
           $publicIP = Invoke-RestMethod "https://api.ipify.org"
-
-          Write-Host ""
           Write-Host "Public IP: $publicIP"
-          Write-Host ""
 
       - name: Verify RDP Port
         shell: powershell
         run: |
-          Write-Host "Checking RDP..."
-
           $success = $false
-
           for ($i = 0; $i -lt 10; $i++) {
-
-            $test = Test-NetConnection `
-              -ComputerName $env:TAILSCALE_IP `
-              -Port 3389 `
-              -WarningAction SilentlyContinue
-
-            if ($test.TcpTestSucceeded) {
-              $success = $true
-              break
-            }
-
+            $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+            if ($test.TcpTestSucceeded) { $success = $true; break }
             Start-Sleep -Seconds 10
           }
+          if (-not $success) { Write-Error "RDP port not reachable"; exit 1 }
+          Write-Host "RDP reachable on port 3389."
 
-          if (-not $success) {
-            Write-Error "RDP not reachable"
-            exit 1
-          }
-
-          Write-Host "RDP reachable."
-
+      # ─────────────────────────────────────────────
+      # SHOW CONNECTION DETAILS
+      # ─────────────────────────────────────────────
       - name: Show Connection Details
         shell: powershell
         run: |
-          Clear-Host
-
+          $runCount = [int]$env:CACHED_RUN_COUNT + 1
           Write-Host ""
           Write-Host "======================================="
           Write-Host "            RDP READY"
           Write-Host "======================================="
-          Write-Host ""
-          Write-Host "IP       : $env:TAILSCALE_IP"
-          Write-Host "Username : RDP"
-          Write-Host "Password : $env:RDP_PASSWORD"
-          Write-Host ""
+          Write-Host "IP            : $env:TAILSCALE_IP"
+          Write-Host "Username      : RDP"
+          Write-Host "Password      : $env:RDP_PASSWORD"
+          Write-Host "---"
+          Write-Host "Session #     : $runCount"
+          Write-Host "First Created : $env:CACHED_CREATED_AT"
           Write-Host "======================================="
-          Write-Host ""
 
-      - name: Keep Runner Alive
+      # ─────────────────────────────────────────────
+      # REAL-TIME FILE WATCHER + KEEP-ALIVE LOOP
+      # Files are watched and synced every 5 minutes
+      # after any change is detected — avoids hammering
+      # the cache on every single keystroke/file write.
+      # ─────────────────────────────────────────────
+      - name: Keep Alive + Real-Time File Sync to Cache Staging
         shell: powershell
         run: |
-          Write-Host "Keeping runner alive for 6 hours..."
+          $rdpHome    = "C:\Users\RDP"
+          $stagingDir = "C:\rdp-cache-staging"
+          $syncFlag   = "C:\rdp-cache-staging\.needs_sync"
 
-          $endTime = (Get-Date).AddMinutes(355)
+          # Create staging dirs
+          foreach ($d in @("userdata\Desktop","userdata\Documents","userdata\Downloads",
+                           "userdata\Pictures","userdata\Videos","userdata\Music",
+                           "appdata\Roaming","appdata\Local",
+                           "browser\Chrome","browser\Edge")) {
+            New-Item -ItemType Directory -Force -Path "$stagingDir\$d" | Out-Null
+          }
+
+          # ── FileSystemWatcher setup ──────────────────────────────────────────
+          $watchPaths = @(
+            "$rdpHome\Desktop",
+            "$rdpHome\Documents",
+            "$rdpHome\Downloads",
+            "$rdpHome\Pictures",
+            "$rdpHome\Videos",
+            "$rdpHome\Music",
+            "$rdpHome\AppData\Roaming",
+            "$rdpHome\AppData\Local"
+          )
+
+          $watchers = @()
+          foreach ($path in $watchPaths) {
+            if (-not (Test-Path $path)) {
+              New-Item -ItemType Directory -Force -Path $path | Out-Null
+            }
+            $w = New-Object System.IO.FileSystemWatcher
+            $w.Path                = $path
+            $w.IncludeSubdirectories = $true
+            $w.EnableRaisingEvents = $true
+            # On any change, just drop a flag file — actual copy is batched
+            $action = {
+              $flagPath = "C:\rdp-cache-staging\.needs_sync"
+              if (-not (Test-Path $flagPath)) {
+                New-Item -ItemType File -Force -Path $flagPath | Out-Null
+              }
+            }
+            Register-ObjectEvent $w "Changed" -Action $action | Out-Null
+            Register-ObjectEvent $w "Created" -Action $action | Out-Null
+            Register-ObjectEvent $w "Deleted" -Action $action | Out-Null
+            Register-ObjectEvent $w "Renamed" -Action $action | Out-Null
+            $watchers += $w
+          }
+
+          Write-Host "FileSystemWatcher active on RDP user profile."
+          Write-Host "Files will be synced to cache staging within 5 min of any change."
+
+          # ── Sync function ────────────────────────────────────────────────────
+          function Sync-ToStaging {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Change detected — syncing to cache staging..."
+
+            $map = @{
+              "$rdpHome\Desktop"             = "C:\rdp-userdata\Desktop"
+              "$rdpHome\Documents"           = "C:\rdp-userdata\Documents"
+              "$rdpHome\Downloads"           = "C:\rdp-userdata\Downloads"
+              "$rdpHome\Pictures"            = "C:\rdp-userdata\Pictures"
+              "$rdpHome\Videos"              = "C:\rdp-userdata\Videos"
+              "$rdpHome\Music"               = "C:\rdp-userdata\Music"
+              "$rdpHome\AppData\Roaming"     = "C:\rdp-appdata\Roaming"
+              "$rdpHome\AppData\Local"       = "C:\rdp-appdata\Local"
+            }
+
+            # Browser data
+            $chromeProfile = "$rdpHome\AppData\Local\Google\Chrome\User Data"
+            $edgeProfile   = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
+            if (Test-Path $chromeProfile) {
+              $map[$chromeProfile] = "C:\rdp-browser\Chrome"
+            }
+            if (Test-Path $edgeProfile) {
+              $map[$edgeProfile] = "C:\rdp-browser\Edge"
+            }
+
+            foreach ($src in $map.Keys) {
+              $dst = $map[$src]
+              if (Test-Path $src) {
+                New-Item -ItemType Directory -Force -Path $dst | Out-Null
+                # robocopy: mirror source to dest, skip files in use, no log spam
+                robocopy $src $dst /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ `
+                  /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
+              }
+            }
+
+            # Remove the sync flag
+            Remove-Item $syncFlag -Force -ErrorAction SilentlyContinue
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Sync complete."
+          }
+
+          # ── Main keep-alive loop ─────────────────────────────────────────────
+          $endTime       = (Get-Date).AddMinutes(345)
+          $lastSyncCheck = (Get-Date)
+          $syncCooldown  = 300   # seconds — sync at most once every 5 min
 
           while ((Get-Date) -lt $endTime) {
+            $now         = Get-Date
+            $secsSinceLast = ((Get-Date) - $lastSyncCheck).TotalSeconds
+
+            if ((Test-Path $syncFlag) -and ($secsSinceLast -ge $syncCooldown)) {
+              Sync-ToStaging
+              $lastSyncCheck = Get-Date
+            }
+
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active..."
             Start-Sleep -Seconds 60
           }
 
-          Write-Host "Session timeout reached. Shutting down gracefully."
+          # Final sync before shutdown
+          Write-Host "Session ending — performing final sync..."
+          Sync-ToStaging
+          Write-Host "Final sync done. Runner shutting down."
+
+      # ─────────────────────────────────────────────
+      # SAVE ALL CACHES AT END OF SESSION
+      # (catches anything missed by the watcher)
+      # ─────────────────────────────────────────────
+      - name: Save Session Metadata
+        if: always()
+        shell: powershell
+        run: |
+          $runCount = [int]$env:CACHED_RUN_COUNT + 1
+          New-Item -ItemType Directory -Force -Path "C:\rdp-session" | Out-Null
+          @{
+            hostname     = $env:TS_HOSTNAME
+            tailscale_ip = $env:TAILSCALE_IP
+            run_count    = $runCount
+            created_at   = $env:CACHED_CREATED_AT
+            last_run_at  = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            last_run_id  = "${{ github.run_id }}"
+          } | ConvertTo-Json | Set-Content "C:\rdp-session\session.json"
+          Write-Host "Session metadata saved. Total sessions: $runCount"
+
+      - name: Store Session Metadata Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\rdp-session
+          key: rdp-session-data
+
+      - name: Store User Data Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\rdp-userdata
+          key: rdp-userdata-v1
+
+      - name: Store AppData Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\rdp-appdata
+          key: rdp-appdata-v1
+
+      - name: Store Browser Data Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: C:\rdp-browser
+          key: rdp-browser-v1
