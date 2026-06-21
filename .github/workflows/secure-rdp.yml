@@ -20,40 +20,93 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Create Cache Directories
+      # ── STEP 1: Everything that can run in parallel at startup ──────────────
+      - name: Parallel Setup (Dirs + RDP + User + Tailscale Download)
         shell: powershell
         run: |
+          # --- Create all cache dirs immediately ---
           $dirs = @(
             "C:\rdp-session",
-            "C:\rdp-userdata\Desktop",
-            "C:\rdp-userdata\Documents",
-            "C:\rdp-userdata\Downloads",
-            "C:\rdp-userdata\Pictures",
-            "C:\rdp-userdata\Videos",
-            "C:\rdp-userdata\Music",
-            "C:\rdp-appdata\Roaming",
-            "C:\rdp-appdata\Local",
-            "C:\rdp-browser\Chrome",
-            "C:\rdp-browser\Edge",
+            "C:\rdp-userdata\Desktop","C:\rdp-userdata\Documents",
+            "C:\rdp-userdata\Downloads","C:\rdp-userdata\Pictures",
+            "C:\rdp-userdata\Videos","C:\rdp-userdata\Music",
+            "C:\rdp-appdata\Roaming","C:\rdp-appdata\Local",
+            "C:\rdp-browser\Chrome","C:\rdp-browser\Edge",
             "C:\rdp-cache-staging"
           )
-          foreach ($d in $dirs) {
-            New-Item -ItemType Directory -Force -Path $d | Out-Null
-          }
-          Write-Host "All cache directories created."
+          foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 
+          # --- Start Tailscale download in background immediately ---
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $tsInstaller = "$env:TEMP\tailscale.msi"
+          $tsJob = Start-Job -ScriptBlock {
+            param($url, $out)
+            Invoke-WebRequest -Uri $url -OutFile $out
+          } -ArgumentList $tsUrl, $tsInstaller
+
+          # --- Configure RDP in parallel with download ---
+          $rdpJob = Start-Job -ScriptBlock {
+            Set-ItemProperty `
+              -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+              -Name "fDenyTSConnections" -Value 0
+            Set-ItemProperty `
+              -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+              -Name "UserAuthentication" -Value 1
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+            Restart-Service TermService -Force
+          }
+
+          # --- Create RDP user in parallel ---
+          $userJob = Start-Job -ScriptBlock {
+            $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+            if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+            }
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+            return $password
+          }
+
+          # --- Wait for all parallel jobs ---
+          Write-Host "Waiting for parallel setup tasks..."
+          $rdpJob  | Wait-Job | Out-Null
+          $userJob | Wait-Job | Out-Null
+          $password = Receive-Job $userJob
+
+          # --- Write RDP password to env ---
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "RDP configured and user created."
+
+          # --- Wait for Tailscale download (started first so likely done) ---
+          Write-Host "Waiting for Tailscale download..."
+          $tsJob | Wait-Job | Out-Null
+          Write-Host "Tailscale downloaded."
+
+          # --- Install Tailscale immediately ---
+          Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /qn /norestart" -Wait
+          Remove-Item $tsInstaller -Force
+          Write-Host "Tailscale installed."
+
+          # --- Cleanup jobs ---
+          Remove-Job $tsJob, $rdpJob, $userJob
+
+      # ── STEP 2: Resolve restore flag ───────────────────────────────────────
       - name: Resolve Restore Flag
         shell: powershell
         run: |
           $skipRestore = "${{ github.event.inputs.skip_restore }}"
           if ($skipRestore -eq "true") {
             "SHOULD_RESTORE=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            Write-Host "Restore skipped by user."
+            Write-Host "Restore skipped."
           } else {
             "SHOULD_RESTORE=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             Write-Host "Will restore from cache."
           }
 
+      # ── STEP 3: Restore all caches (parallel downloads from GitHub CDN) ────
       - name: Restore Session Metadata Cache
         if: env.SHOULD_RESTORE == 'true'
         uses: actions/cache/restore@v4
@@ -86,186 +139,158 @@ jobs:
           key: rdp-browser-v1
           restore-keys: rdp-browser-
 
-      - name: Load Cached Session Data
+      # ── STEP 4: Load metadata + restore files in parallel ──────────────────
+      - name: Load Session Data + Restore Files to Profile
         shell: powershell
         run: |
+          # --- Load session metadata ---
           $cacheFile = "C:\rdp-session\session.json"
           if (Test-Path $cacheFile) {
             $session = Get-Content $cacheFile | ConvertFrom-Json
-            $runCount = $session.run_count
+            $runCount  = $session.run_count
             $createdAt = $session.created_at
-            "CACHED_RUN_COUNT=$runCount" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "CACHED_CREATED_AT=$createdAt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            Write-Host "Previous runs: $runCount"
-            Write-Host "First created: $createdAt"
+            Write-Host "Previous runs: $runCount | First created: $createdAt"
           } else {
-            $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            "CACHED_RUN_COUNT=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            "CACHED_CREATED_AT=$now" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            $runCount  = 0
+            $createdAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             Write-Host "No previous cache - fresh session."
           }
+          "CACHED_RUN_COUNT=$runCount"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CACHED_CREATED_AT=$createdAt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Configure Windows RDP
-        shell: powershell
-        run: |
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
-          Set-ItemProperty `
-            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" -Value 1
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Restart-Service TermService -Force
-          Write-Host "RDP configured."
-
-      - name: Create RDP User
-        shell: powershell
-        run: |
-          $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-          $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP"
-          }
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "RDP user created."
-
-      - name: Restore User Files into RDP Profile
-        if: env.SHOULD_RESTORE == 'true'
-        shell: powershell
-        run: |
+          # --- Restore files into RDP profile in background ---
           $rdpHome = "C:\Users\RDP"
-          for ($i = 0; $i -lt 10; $i++) {
+          for ($i = 0; $i -lt 15; $i++) {
             if (Test-Path $rdpHome) { break }
-            Start-Sleep -Seconds 3
+            Start-Sleep -Seconds 2
           }
           if (-not (Test-Path $rdpHome)) {
             New-Item -ItemType Directory -Force -Path $rdpHome | Out-Null
           }
-          function Restore-Folder($src, $dst) {
+
+          # Use robocopy for fast parallel restore (much faster than Copy-Item)
+          $restoreMap = @{
+            "C:\rdp-userdata\Desktop"   = "$rdpHome\Desktop"
+            "C:\rdp-userdata\Documents" = "$rdpHome\Documents"
+            "C:\rdp-userdata\Downloads" = "$rdpHome\Downloads"
+            "C:\rdp-userdata\Pictures"  = "$rdpHome\Pictures"
+            "C:\rdp-userdata\Videos"    = "$rdpHome\Videos"
+            "C:\rdp-userdata\Music"     = "$rdpHome\Music"
+            "C:\rdp-appdata\Roaming"    = "$rdpHome\AppData\Roaming"
+            "C:\rdp-appdata\Local"      = "$rdpHome\AppData\Local"
+            "C:\rdp-browser\Chrome"     = "$rdpHome\AppData\Local\Google\Chrome\User Data"
+            "C:\rdp-browser\Edge"       = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
+          }
+
+          $restoreJobs = @()
+          foreach ($src in $restoreMap.Keys) {
+            $dst = $restoreMap[$src]
             if (Test-Path $src) {
-              Write-Host "Restoring $src -> $dst"
               New-Item -ItemType Directory -Force -Path $dst | Out-Null
-              Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
-            } else {
-              Write-Host "No cache for: $src (skipping)"
+              $restoreJobs += Start-Job -ScriptBlock {
+                param($s, $d)
+                robocopy $s $d /MIR /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
+              } -ArgumentList $src, $dst
             }
           }
-          Restore-Folder "C:\rdp-userdata\Desktop"   "$rdpHome\Desktop"
-          Restore-Folder "C:\rdp-userdata\Documents" "$rdpHome\Documents"
-          Restore-Folder "C:\rdp-userdata\Downloads" "$rdpHome\Downloads"
-          Restore-Folder "C:\rdp-userdata\Pictures"  "$rdpHome\Pictures"
-          Restore-Folder "C:\rdp-userdata\Videos"    "$rdpHome\Videos"
-          Restore-Folder "C:\rdp-userdata\Music"     "$rdpHome\Music"
-          Restore-Folder "C:\rdp-appdata\Roaming"    "$rdpHome\AppData\Roaming"
-          Restore-Folder "C:\rdp-appdata\Local"      "$rdpHome\AppData\Local"
-          if (Test-Path "C:\rdp-browser\Chrome") {
-            Restore-Folder "C:\rdp-browser\Chrome" "$rdpHome\AppData\Local\Google\Chrome\User Data"
-          }
-          if (Test-Path "C:\rdp-browser\Edge") {
-            Restore-Folder "C:\rdp-browser\Edge" "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
-          }
-          Write-Host "All cached files restored."
 
-      - name: Install Tailscale
-        shell: powershell
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
-          Remove-Item $installer -Force
-          Write-Host "Tailscale installed."
+          if ($restoreJobs.Count -gt 0) {
+            Write-Host "Restoring $($restoreJobs.Count) folders in parallel..."
+            $restoreJobs | Wait-Job | Out-Null
+            $restoreJobs | Remove-Job
+            Write-Host "All files restored."
+          } else {
+            Write-Host "No cached files to restore."
+          }
 
+      # ── STEP 5: Connect Tailscale ───────────────────────────────────────────
       - name: Connect Tailscale
         shell: powershell
         run: |
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $hostname = "github-rdp-${{ github.run_id }}"
+          $hostname  = "github-rdp-${{ github.run_id }}"
+
           Start-Service Tailscale
-          Start-Sleep -Seconds 10
+          # Reduced sleep - service starts faster than 10s usually
+          Start-Sleep -Seconds 5
+
           & $tailscale up `
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
             --hostname="$hostname" `
             --accept-routes `
             --reset
+
           if ($LASTEXITCODE -ne 0) { Write-Error "Tailscale failed"; exit 1 }
+
           $ip = $null
           for ($i = 0; $i -lt 20; $i++) {
             try { $ip = (& $tailscale ip -4 | Select-Object -First 1).Trim() } catch {}
             if ($ip) { break }
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds 3
           }
           if (-not $ip) { Write-Error "No Tailscale IP assigned"; exit 1 }
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          "TAILSCALE_IP=$ip"      | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "TS_HOSTNAME=$hostname" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           & $tailscale status
 
-      - name: Verify Public IP
+      # ── STEP 6: Verify + Show details ──────────────────────────────────────
+      - name: Verify RDP Port + Show Connection Details
         shell: powershell
         run: |
-          $publicIP = Invoke-RestMethod "https://api.ipify.org"
-          Write-Host "Public IP: $publicIP"
+          # Verify public IP and RDP port in parallel
+          $ipJob = Start-Job -ScriptBlock {
+            (Invoke-RestMethod "https://api.ipify.org")
+          }
 
-      - name: Verify RDP Port
-        shell: powershell
-        run: |
-          $success = $false
+          $rdpOk = $false
           for ($i = 0; $i -lt 10; $i++) {
             $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-            if ($test.TcpTestSucceeded) { $success = $true; break }
-            Start-Sleep -Seconds 10
+            if ($test.TcpTestSucceeded) { $rdpOk = $true; break }
+            Start-Sleep -Seconds 5
           }
-          if (-not $success) { Write-Error "RDP port not reachable"; exit 1 }
-          Write-Host "RDP reachable on port 3389."
 
-      - name: Show Connection Details
-        shell: powershell
-        run: |
+          $ipJob | Wait-Job | Out-Null
+          $publicIP = Receive-Job $ipJob
+          Remove-Job $ipJob
+
+          if (-not $rdpOk) { Write-Error "RDP port not reachable"; exit 1 }
+
           $runCount = [int]$env:CACHED_RUN_COUNT + 1
+          Write-Host ""
           Write-Host "======================================="
           Write-Host "            RDP READY"
           Write-Host "======================================="
           Write-Host "IP            : $env:TAILSCALE_IP"
           Write-Host "Username      : RDP"
           Write-Host "Password      : $env:RDP_PASSWORD"
+          Write-Host "Public IP     : $publicIP"
           Write-Host "Session #     : $runCount"
           Write-Host "First Created : $env:CACHED_CREATED_AT"
           Write-Host "======================================="
 
+      # ── STEP 7: Keep alive + file watcher ──────────────────────────────────
       - name: Keep Alive + Real-Time File Sync
         shell: powershell
         run: |
-          $rdpHome = "C:\Users\RDP"
+          $rdpHome  = "C:\Users\RDP"
           $syncFlag = "C:\rdp-cache-staging\.needs_sync"
 
           $watchPaths = @(
-            "$rdpHome\Desktop",
-            "$rdpHome\Documents",
-            "$rdpHome\Downloads",
-            "$rdpHome\Pictures",
-            "$rdpHome\Videos",
-            "$rdpHome\Music",
-            "$rdpHome\AppData\Roaming",
-            "$rdpHome\AppData\Local"
+            "$rdpHome\Desktop","$rdpHome\Documents","$rdpHome\Downloads",
+            "$rdpHome\Pictures","$rdpHome\Videos","$rdpHome\Music",
+            "$rdpHome\AppData\Roaming","$rdpHome\AppData\Local"
           )
 
           foreach ($path in $watchPaths) {
-            if (-not (Test-Path $path)) {
-              New-Item -ItemType Directory -Force -Path $path | Out-Null
-            }
+            if (-not (Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
             $w = New-Object System.IO.FileSystemWatcher
-            $w.Path = $path
+            $w.Path                  = $path
             $w.IncludeSubdirectories = $true
-            $w.EnableRaisingEvents = $true
+            $w.EnableRaisingEvents   = $true
             $action = {
               $flag = "C:\rdp-cache-staging\.needs_sync"
-              if (-not (Test-Path $flag)) {
-                New-Item -ItemType File -Force -Path $flag | Out-Null
-              }
+              if (-not (Test-Path $flag)) { New-Item -ItemType File -Force -Path $flag | Out-Null }
             }
             Register-ObjectEvent $w "Changed" -Action $action | Out-Null
             Register-ObjectEvent $w "Created" -Action $action | Out-Null
@@ -289,22 +314,32 @@ jobs:
               "$rdpHome\AppData\Local"   = "C:\rdp-appdata\Local"
             }
             $chrome = "$rdpHome\AppData\Local\Google\Chrome\User Data"
-            $edge = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
+            $edge   = "$rdpHome\AppData\Local\Microsoft\Edge\User Data"
             if (Test-Path $chrome) { $map[$chrome] = "C:\rdp-browser\Chrome" }
             if (Test-Path $edge)   { $map[$edge]   = "C:\rdp-browser\Edge" }
+
+            $syncJobs = @()
             foreach ($src in $map.Keys) {
               $dst = $map[$src]
               if (Test-Path $src) {
                 New-Item -ItemType Directory -Force -Path $dst | Out-Null
-                robocopy $src $dst /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
+                $syncJobs += Start-Job -ScriptBlock {
+                  param($s, $d)
+                  robocopy $s $d /MIR /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /XJ /XF "*.lock" "*.ldb" "*.log" 2>$null | Out-Null
+                } -ArgumentList $src, $dst
               }
             }
+            if ($syncJobs.Count -gt 0) {
+              $syncJobs | Wait-Job | Out-Null
+              $syncJobs | Remove-Job
+            }
+
             Remove-Item $syncFlag -Force -ErrorAction SilentlyContinue
             $ts2 = Get-Date -Format "HH:mm:ss"
             Write-Host "[$ts2] Sync complete."
           }
 
-          $endTime = (Get-Date).AddMinutes(345)
+          $endTime      = (Get-Date).AddMinutes(345)
           $lastSyncTime = Get-Date
           $syncCooldown = 300
 
@@ -323,6 +358,7 @@ jobs:
           Sync-ToStaging
           Write-Host "Done."
 
+      # ── STEP 8: Save all caches ─────────────────────────────────────────────
       - name: Save Session Metadata
         if: always()
         shell: powershell
