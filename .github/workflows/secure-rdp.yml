@@ -57,10 +57,9 @@ jobs:
             Restart-Service TermService -Force
           }
 
-          # Create RDP user with FIXED credentials from GitHub Secrets
-          # Username: RDP (always the same)
-          # Password: from secret RDP_PASSWORD (set once in repo Settings -> Secrets)
-          $password = "${{ secrets.RDP_PASSWORD }}"
+          # Create RDP user on MAIN THREAD (SecureString can't cross job boundaries)
+          $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+          $password = -join ((1..20) | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "RDP"
@@ -69,7 +68,7 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "RDP user created with fixed credentials."
+          Write-Host "RDP user created."
 
           # Wait for RDP config job
           $rdpJob | Wait-Job | Out-Null
